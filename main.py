@@ -19,8 +19,10 @@ from collections import Counter
 from typing import List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from kiwipiepy import Kiwi
+from blog_seo_service import router as blog_router
 
 # ---------------------------------------------------------------------------
 # 설정
@@ -37,6 +39,15 @@ KEYWORD_TAGS = {"NNG", "NNP", "SL"}
 kiwi = Kiwi()
 
 app = FastAPI(title="Upclick Naver Blog Worker", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
+
+app.include_router(blog_router)
 
 
 # ---------------------------------------------------------------------------

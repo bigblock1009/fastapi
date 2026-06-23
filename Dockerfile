@@ -16,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 앱 코드 복사
-COPY main.py .
+COPY main.py blog_seo_service.py ./
 
 # 클라우드타입은 PORT 환경변수를 주입할 수 있다. 없으면 8000.
 ENV PORT=8000
