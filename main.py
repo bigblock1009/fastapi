@@ -21,22 +21,15 @@ from typing import List, Optional
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from kiwipiepy import Kiwi
-from blog_seo_service import router as blog_router
+# blog_seo_service 가 Kiwi를 초기화하므로 그 인스턴스를 재사용 (이중 초기화 방지)
+from blog_seo_service import router as blog_router, kiwi
 
 # ---------------------------------------------------------------------------
 # 설정
 # ---------------------------------------------------------------------------
-# 두 서버 간 공유 시크릿. 클라우드타입 콘솔의 환경변수에 WORKER_SECRET 으로 등록.
-# 코드/레포에는 절대 박지 않는다.
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "")
 
-# 키워드로 인정할 품사 태그
-#   NNG = 일반명사, NNP = 고유명사, SL = 외국어(영문 키워드: AI, ETF 등)
 KEYWORD_TAGS = {"NNG", "NNP", "SL"}
-
-# Kiwi 인스턴스는 프로세스당 1번만 생성해 재사용(모델 로딩 비용이 큼).
-kiwi = Kiwi()
 
 app = FastAPI(title="Upclick Naver Blog Worker", version="1.0")
 
