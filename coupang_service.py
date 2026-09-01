@@ -31,10 +31,15 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import APIRouter
-from pydantic import BaseModel, Field
 
-router = APIRouter(prefix="/coupang", tags=["coupang"])
+# fastapi/pydantic 은 웹 엔드포인트에만 필요하다. 6) CLI 로 셀렉터만 점검할 때는
+# requests + beautifulsoup4 만 있으면 되도록 import 실패를 삼킨다.
+try:
+    from fastapi import APIRouter
+    from pydantic import BaseModel, Field
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
 
 
 # ==================================================================
@@ -399,71 +404,75 @@ def extract_product(html: str) -> Dict[str, Any]:
 # ==================================================================
 # 5) 엔드포인트
 # ==================================================================
-class ProductReq(BaseModel):
-    url: Optional[str] = Field(None, description="쿠팡 상품 페이지 URL")
-    product_id: Optional[str] = Field(None, description="url 대신 productId 직접 지정")
-    item_id: Optional[str] = Field(None, description="옵션 상품 itemId")
-    vendor_item_id: Optional[str] = Field(None, description="vendorItemId")
-    render: bool = Field(False, description="True면 Playwright 브라우저 렌더링으로 가져온다")
-    debug: bool = Field(False, description="True면 어느 전략에서 값을 얻었는지 함께 반환")
+# fastapi 가 없는 환경(CLI 전용)에서는 이 블록을 통째로 건너뛴다.
+if HAS_FASTAPI:
+    router = APIRouter(prefix="/coupang", tags=["coupang"])
+
+    class ProductReq(BaseModel):
+        url: Optional[str] = Field(None, description="쿠팡 상품 페이지 URL")
+        product_id: Optional[str] = Field(None, description="url 대신 productId 직접 지정")
+        item_id: Optional[str] = Field(None, description="옵션 상품 itemId")
+        vendor_item_id: Optional[str] = Field(None, description="vendorItemId")
+        render: bool = Field(False, description="True면 Playwright 브라우저 렌더링으로 가져온다")
+        debug: bool = Field(False, description="True면 어느 전략에서 값을 얻었는지 함께 반환")
 
 
-class ProductRes(BaseModel):
-    ok: bool
-    product_id: Optional[str] = None
-    item_id: Optional[str] = None
-    url: Optional[str] = None
-    name: Optional[str] = None
-    price: Optional[int] = None
-    price_text: Optional[str] = None   # '12,900원' 형태의 표시용 문자열
-    thumbnail: Optional[str] = None
-    sources: Optional[Dict[str, str]] = None
-    error: Optional[str] = None
+    class ProductRes(BaseModel):
+        ok: bool
+        product_id: Optional[str] = None
+        item_id: Optional[str] = None
+        url: Optional[str] = None
+        name: Optional[str] = None
+        price: Optional[int] = None
+        price_text: Optional[str] = None   # '12,900원' 형태의 표시용 문자열
+        thumbnail: Optional[str] = None
+        sources: Optional[Dict[str, str]] = None
+        error: Optional[str] = None
 
 
-@router.get("/health")
-def coupang_health():
-    return {"ok": True, "service": "coupang-product", "version": "1.0"}
+    @router.get("/health")
+    def coupang_health():
+        return {"ok": True, "service": "coupang-product", "version": "1.0"}
 
 
-@router.post("/product", response_model=ProductRes)
-def get_product(req: ProductReq):
-    if req.url:
-        product_id, item_id, vendor_item_id = parse_product_url(req.url)
-        if not product_id:
-            return ProductRes(ok=False,
-                              error="쿠팡 상품 URL 이 아닙니다. /vp/products/{id} 형식이어야 합니다.")
-        item_id = item_id or req.item_id
-        vendor_item_id = vendor_item_id or req.vendor_item_id
-    elif req.product_id:
-        product_id = req.product_id
-        item_id, vendor_item_id = req.item_id, req.vendor_item_id
-    else:
-        return ProductRes(ok=False, error="url 또는 product_id 중 하나는 필요합니다.")
+    @router.post("/product", response_model=ProductRes)
+    def get_product(req: ProductReq):
+        if req.url:
+            product_id, item_id, vendor_item_id = parse_product_url(req.url)
+            if not product_id:
+                return ProductRes(ok=False,
+                                  error="쿠팡 상품 URL 이 아닙니다. /vp/products/{id} 형식이어야 합니다.")
+            item_id = item_id or req.item_id
+            vendor_item_id = vendor_item_id or req.vendor_item_id
+        elif req.product_id:
+            product_id = req.product_id
+            item_id, vendor_item_id = req.item_id, req.vendor_item_id
+        else:
+            return ProductRes(ok=False, error="url 또는 product_id 중 하나는 필요합니다.")
 
-    url = build_product_url(product_id, item_id, vendor_item_id)
-    html, err = (render_product_html(url) if req.render else fetch_product_html(url))
-    if err:
-        return ProductRes(ok=False, product_id=product_id, item_id=item_id,
-                          url=url, error=err)
+        url = build_product_url(product_id, item_id, vendor_item_id)
+        html, err = (render_product_html(url) if req.render else fetch_product_html(url))
+        if err:
+            return ProductRes(ok=False, product_id=product_id, item_id=item_id,
+                              url=url, error=err)
 
-    data = extract_product(html)
-    if data["name"] is None and data["price"] is None:
+        data = extract_product(html)
+        if data["name"] is None and data["price"] is None:
+            return ProductRes(
+                ok=False, product_id=product_id, item_id=item_id, url=url,
+                error=("페이지는 받았지만 상품 정보를 찾지 못했습니다. "
+                       "셀렉터가 바뀌었거나 차단 페이지일 수 있습니다."),
+                sources=data["sources"] if req.debug else None,
+            )
+
         return ProductRes(
-            ok=False, product_id=product_id, item_id=item_id, url=url,
-            error=("페이지는 받았지만 상품 정보를 찾지 못했습니다. "
-                   "셀렉터가 바뀌었거나 차단 페이지일 수 있습니다."),
+            ok=True, product_id=product_id, item_id=item_id, url=url,
+            name=data["name"],
+            price=data["price"],
+            price_text=f"{data['price']:,}원" if data["price"] else None,
+            thumbnail=data["thumbnail"],
             sources=data["sources"] if req.debug else None,
         )
-
-    return ProductRes(
-        ok=True, product_id=product_id, item_id=item_id, url=url,
-        name=data["name"],
-        price=data["price"],
-        price_text=f"{data['price']:,}원" if data["price"] else None,
-        thumbnail=data["thumbnail"],
-        sources=data["sources"] if req.debug else None,
-    )
 
 
 # ==================================================================
@@ -489,7 +498,8 @@ if __name__ == "__main__":
         raise SystemExit(2)
 
     if "--dump" in sys.argv:
-        dump_path = sys.argv[sys.argv.index("--dump") + 1]
+        _i = sys.argv.index("--dump") + 1
+        dump_path = sys.argv[_i] if _i < len(sys.argv) else "out.html"
         with open(dump_path, "w", encoding="utf-8") as fp:
             fp.write(page_html)
         print(f"[dump] {dump_path} ({len(page_html):,} bytes)")
