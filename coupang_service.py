@@ -2,7 +2,7 @@
 """
 업클릭 — 쿠팡 상품 정보 추출기
 ================================
-상품 URL(또는 productId/itemId) → 상품명 / 가격 / 썸네일 이미지 URL
+상품 URL(또는 productId/itemId) → 상품명 / 가격(판매가·정가·할인율) / 썸네일
 
 엔드포인트 (main.py 에 /coupang prefix 로 마운트됨)
   GET  /coupang/health    → 헬스체크
@@ -25,6 +25,7 @@
     쿠팡 파트너스 Open API 를 사용할 것.
 """
 
+import copy
 import json
 import re
 from typing import Any, Dict, NamedTuple, Optional, Tuple
@@ -412,6 +413,42 @@ PRICE_CONTAINER_SELECTORS = [
     ".prod-price",
 ]
 PRICE_TEXT_RE = re.compile(r"([0-9][0-9,]*)\s*원")
+# 할인 상품의 가격 블록에는 취소선 정가가 판매가보다 먼저 나온다. 그대로 첫
+# 매치를 집으면 정가를 판매가로 오인하므로, 취소선 노드를 먼저 걷어낸다.
+STRIKETHROUGH_HINT = "line-through"
+
+
+def _container_prices(node) -> Tuple[Optional[int], Optional[int]]:
+    """가격 컨테이너에서 (판매가, 정가) 를 뽑는다.
+
+    가격 숫자와 '원' 이 서로 다른 태그에 나뉘어 있어(<span>24,900</span>원)
+    태그 단위로 훑으면 잡히지 않는다. 그래서 컨테이너를 복사한 뒤 취소선이
+    걸린 서브트리를 통째로 제거하고, 남은 텍스트에서 첫 금액을 판매가로 본다.
+    와우 전용 쿠폰가 0원은 parse_price 가 걸러내므로 자연히 건너뛴다.
+    """
+    original = None
+    for el in node.select('[class*="' + STRIKETHROUGH_HINT + '"]'):
+        m = PRICE_TEXT_RE.search(el.get_text(" ", strip=True))
+        if m and parse_price(m.group(1)):
+            original = parse_price(m.group(1))
+            break
+
+    stripped = copy.copy(node)
+    for el in stripped.select('[class*="' + STRIKETHROUGH_HINT + '"]'):
+        el.decompose()
+
+    sale = None
+    for m in PRICE_TEXT_RE.finditer(stripped.get_text(" ", strip=True)):
+        sale = parse_price(m.group(1))
+        if sale:
+            break
+
+    # 정가가 판매가 이하면 잘못 잡은 것이다. 정가는 버린다.
+    if sale and original and original <= sale:
+        original = None
+    return sale, original
+
+
 IMAGE_SELECTORS = [
     "img.prod-image__detail",
     ".prod-image__detail img",
@@ -431,6 +468,10 @@ PRICE_JSON_RES = [
     _price_key_re("salePrice"),
     _price_key_re("finalPrice"),
     _price_key_re("price"),
+]
+ORIGINAL_JSON_RES = [
+    _price_key_re("originPrice"),
+    _price_key_re("anchorPrice"),
 ]
 CDN_IMAGE_RE = re.compile(
     r'(?:https?:)?//[a-z0-9.\-]*coupangcdn\.com/[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp)',
@@ -460,8 +501,13 @@ def _iter_jsonld(soup: BeautifulSoup):
             yield node
 
 
-def _from_jsonld(soup: BeautifulSoup):
-    """JSON-LD 의 Product 스키마에서 (name, price, image) 를 뽑는다."""
+def _from_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
+    """JSON-LD 의 Product 스키마에서 name/price/original/image 를 뽑는다.
+
+    쿠팡은 할인 상품일 때 offers.price 에 실제 판매가를, priceSpecification 에
+    priceType=StrikethroughPrice 로 정가(취소선 가격)를 따로 실어 준다.
+    """
+    empty = {"name": None, "price": None, "original": None, "image": None}
     for node in _iter_jsonld(soup):
         types = node.get("@type")
         types = types if isinstance(types, list) else [types]
@@ -474,15 +520,22 @@ def _from_jsonld(soup: BeautifulSoup):
         if isinstance(image, dict):
             image = image.get("url")
 
-        price = None
+        price = original = None
         offers = node.get("offers")
         if isinstance(offers, list):
             offers = offers[0] if offers else None
         if isinstance(offers, dict):
             price = offers.get("price") or offers.get("lowPrice")
+            spec = offers.get("priceSpecification")
+            if isinstance(spec, list):
+                spec = spec[0] if spec else None
+            if isinstance(spec, dict) and "strikethrough" in str(
+                    spec.get("priceType", "")).lower():
+                original = spec.get("price")
 
-        return node.get("name"), price, image
-    return None, None, None
+        return {"name": node.get("name"), "price": price,
+                "original": original, "image": image}
+    return empty
 
 
 def _meta(soup: BeautifulSoup, prop: str) -> Optional[str]:
@@ -495,7 +548,8 @@ def _meta(soup: BeautifulSoup, prop: str) -> Optional[str]:
 def extract_product(html: str) -> Dict[str, Any]:
     """HTML → {name, price, thumbnail, sources}. 못 찾은 값은 None."""
     soup = BeautifulSoup(html, "html.parser")
-    found: Dict[str, Any] = {"name": None, "price": None, "image": None}
+    found: Dict[str, Any] = {"name": None, "price": None,
+                            "original": None, "image": None}
     sources: Dict[str, str] = {}
 
     def take(field: str, value: Any, origin: str) -> None:
@@ -505,10 +559,11 @@ def extract_product(html: str) -> Dict[str, Any]:
             sources[field] = origin
 
     # 1) JSON-LD
-    ld_name, ld_price, ld_image = _from_jsonld(soup)
-    take("name", clean_name(ld_name), "json-ld")
-    take("price", parse_price(ld_price), "json-ld")
-    take("image", normalize_image_url(ld_image), "json-ld")
+    ld = _from_jsonld(soup)
+    take("name", clean_name(ld["name"]), "json-ld")
+    take("price", parse_price(ld["price"]), "json-ld")
+    take("original", parse_price(ld["original"]), "json-ld")
+    take("image", normalize_image_url(ld["image"]), "json-ld")
 
     # 2) OG / 메타 태그
     take("name", clean_name(_meta(soup, "og:title"), from_title=True), "og:title")
@@ -529,14 +584,15 @@ def extract_product(html: str) -> Dict[str, Any]:
             if node and parse_price(node.get_text(" ", strip=True)):
                 take("price", parse_price(node.get_text(" ", strip=True)), f"dom:{sel}")
                 break
-    if found["price"] is None:
+    if found["price"] is None or found["original"] is None:
         for sel in PRICE_CONTAINER_SELECTORS:
             node = soup.select_one(sel)
             if not node:
                 continue
-            m = PRICE_TEXT_RE.search(node.get_text(" ", strip=True))
-            if m and parse_price(m.group(1)):
-                take("price", parse_price(m.group(1)), f"dom:{sel}")
+            sale, original = _container_prices(node)
+            if sale:
+                take("price", sale, f"dom:{sel}")
+                take("original", original, f"dom:{sel}")
                 break
     if found["image"] is None:
         for sel in IMAGE_SELECTORS:
@@ -557,6 +613,12 @@ def extract_product(html: str) -> Dict[str, Any]:
             if m and parse_price(m.group(1)):
                 take("price", parse_price(m.group(1)), "regex:inline-json")
                 break
+    if found["original"] is None:
+        for rx in ORIGINAL_JSON_RES:
+            m = rx.search(html)
+            if m and parse_price(m.group(1)):
+                take("original", parse_price(m.group(1)), "regex:inline-json")
+                break
     if found["image"] is None:
         for m in CDN_IMAGE_RE.finditer(html):
             candidate = normalize_image_url(m.group(0))
@@ -566,9 +628,21 @@ def extract_product(html: str) -> Dict[str, Any]:
     if found["name"] is None and soup.title:
         take("name", clean_name(soup.title.get_text(strip=True), from_title=True), "title")
 
+    # 정가가 판매가 이하면 할인이 아니다(또는 잘못 잡은 값). 버린다.
+    if found["original"] and found["price"] and found["original"] <= found["price"]:
+        found["original"] = None
+        sources.pop("original", None)
+
+    discount_rate = None
+    if found["original"] and found["price"]:
+        discount_rate = round((found["original"] - found["price"])
+                              / found["original"] * 100)
+
     return {
         "name": found["name"],
         "price": found["price"],
+        "original_price": found["original"],
+        "discount_rate": discount_rate,
         "thumbnail": found["image"],
         "sources": sources,
     }
@@ -597,7 +671,10 @@ if HAS_FASTAPI:
         url: Optional[str] = None
         name: Optional[str] = None
         price: Optional[int] = None
-        price_text: Optional[str] = None   # '12,900원' 형태의 표시용 문자열
+        price_text: Optional[str] = None        # '12,900원' 형태의 표시용 문자열
+        original_price: Optional[int] = None    # 취소선 정가 (할인 없으면 None)
+        original_price_text: Optional[str] = None
+        discount_rate: Optional[int] = None     # 정가 대비 할인율(%)
         thumbnail: Optional[str] = None
         sources: Optional[Dict[str, str]] = None
         error: Optional[str] = None
@@ -643,6 +720,10 @@ if HAS_FASTAPI:
             name=data["name"],
             price=data["price"],
             price_text=f"{data['price']:,}원" if data["price"] else None,
+            original_price=data["original_price"],
+            original_price_text=(f"{data['original_price']:,}원"
+                                 if data["original_price"] else None),
+            discount_rate=data["discount_rate"],
             thumbnail=data["thumbnail"],
             sources=data["sources"] if req.debug else None,
         )
