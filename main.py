@@ -8,6 +8,7 @@
 엔드포인트:
   GET  /health            : 살아있는지 핑 (인증 불필요)
   POST /analyze/keywords  : 본문 → 명사/키워드 추출 (X-Worker-Secret 필요)
+  POST /coupang/product   : 쿠팡 상품 URL → 상품명/가격/썸네일 (coupang_service.py)
 
 인증: 요청 헤더 X-Worker-Secret 값이 환경변수 WORKER_SECRET 과 일치해야 함.
 """
@@ -23,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 # blog_seo_service 가 Kiwi를 초기화하므로 그 인스턴스를 재사용 (이중 초기화 방지)
 from blog_seo_service import router as blog_router, kiwi
+from coupang_service import router as coupang_router
 
 # ---------------------------------------------------------------------------
 # 설정
@@ -41,6 +43,7 @@ app.add_middleware(
 )
 
 app.include_router(blog_router)
+app.include_router(coupang_router)
 
 
 # ---------------------------------------------------------------------------
