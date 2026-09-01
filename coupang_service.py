@@ -27,7 +27,7 @@
 
 import json
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,6 +40,13 @@ try:
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
+
+
+class FetchResult(NamedTuple):
+    """페이지 수집 결과. body 는 차단당한 응답 본문까지 담는 진단용 필드."""
+    html: Optional[str]
+    error: Optional[str]
+    body: Optional[str]
 
 
 # ==================================================================
@@ -74,6 +81,19 @@ def build_product_url(product_id: str,
     return url + ("?" + "&".join(qs) if qs else "")
 
 
+def build_mobile_url(product_id: str,
+                     item_id: Optional[str] = None,
+                     vendor_item_id: Optional[str] = None) -> str:
+    """모바일 상품 URL. 데스크톱이 403 일 때 폴백으로 쓴다."""
+    qs = []
+    if item_id:
+        qs.append(f"itemId={item_id}")
+    if vendor_item_id:
+        qs.append(f"vendorItemId={vendor_item_id}")
+    url = f"https://m.coupang.com/vm/products/{product_id}"
+    return url + ("?" + "&".join(qs) if qs else "")
+
+
 # ==================================================================
 # 2) 페이지 가져오기
 # ==================================================================
@@ -97,6 +117,23 @@ BASE_HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
+# 데스크톱이 403 으로 막힐 때 쓰는 모바일 헤더. 쿠팡은 두 경로의 봇 판정
+# 기준이 달라서, 한쪽이 막혀도 다른 쪽은 통과하는 경우가 있다.
+MOBILE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                   "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                   "Version/17.0 Mobile/15E148 Safari/604.1"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+}
+
 BLOCK_MARKERS = (
     "Access Denied", "Request Rejected", "비정상적인 접근",
     "잠시 후 다시 시도", "Service Unavailable",
@@ -110,42 +147,68 @@ def _looks_blocked(html: str) -> bool:
     return any(m in html[:4000] for m in BLOCK_MARKERS)
 
 
-def fetch_product_html(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str]]:
-    """requests 로 상품 페이지 HTML 을 받아온다. (html, error) 반환."""
-    session = requests.Session()
-    session.headers.update(BASE_HEADERS)
+def fetch_product_html(url: str, timeout: int = 20) -> FetchResult:
+    """requests 로 상품 페이지를 받아온다. 데스크톱 → 모바일 순으로 시도한다.
 
-    # 메인 페이지를 먼저 찍어 PCID 등 세션 쿠키를 확보한다. 쿠키 없이 상품
-    # 페이지를 바로 때리면 차단 페이지가 돌아오는 경우가 많다.
-    try:
-        session.get("https://www.coupang.com/", timeout=timeout)
-    except requests.RequestException:
-        pass  # 워밍업 실패는 치명적이지 않다. 본 요청은 그대로 진행.
+    반환은 (html, error, body). html 은 정상 페이지일 때만 채워지고,
+    body 는 차단당했을 때의 응답 본문까지 담는다 — 왜 막혔는지 확인하려면
+    이 본문을 봐야 하므로 --dump 가 실패 시에도 파일을 남길 수 있게 한다.
+    """
+    pid, iid, vid = parse_product_url(url)
 
-    try:
-        r = session.get(url, headers={"Referer": "https://www.coupang.com/"},
-                        timeout=timeout)
-    except requests.RequestException as e:
-        return None, f"요청 실패: {e}"
+    # (라벨, URL, 헤더, 워밍업용 홈) 순서대로 시도한다.
+    attempts = [("desktop", url, BASE_HEADERS, "https://www.coupang.com/")]
+    if pid:
+        attempts.append(("mobile", build_mobile_url(pid, iid, vid),
+                         MOBILE_HEADERS, "https://m.coupang.com/"))
 
-    if r.status_code != 200:
-        return None, (f"HTTP {r.status_code} — 쿠팡 봇 차단일 수 있습니다. "
-                      f"render=true 로 재시도해 보세요.")
+    last_body: Optional[str] = None
+    reasons = []
 
-    r.encoding = "utf-8"
-    html = r.text
-    if _looks_blocked(html):
-        return None, "차단 페이지가 반환되었습니다. render=true 로 재시도해 보세요."
-    return html, None
+    for label, target, headers, home in attempts:
+        session = requests.Session()
+        session.headers.update(headers)
+
+        # 홈을 먼저 찍어 PCID 등 세션 쿠키를 확보한다. 쿠키 없이 상품 페이지를
+        # 바로 때리면 차단당하는 경우가 많다.
+        try:
+            session.get(home, timeout=timeout)
+        except requests.RequestException:
+            pass  # 워밍업 실패는 치명적이지 않다. 본 요청은 그대로 진행.
+
+        try:
+            r = session.get(target, headers={"Referer": home}, timeout=timeout)
+        except requests.RequestException as e:
+            reasons.append(f"{label}: 요청 실패({e.__class__.__name__})")
+            continue
+
+        r.encoding = "utf-8"
+        last_body = r.text
+
+        if r.status_code != 200:
+            reasons.append(f"{label}: HTTP {r.status_code}")
+            continue
+        if _looks_blocked(r.text):
+            reasons.append(f"{label}: 차단 페이지({len(r.text):,}B)")
+            continue
+
+        return FetchResult(r.text, None, r.text)
+
+    return FetchResult(
+        None,
+        "쿠팡이 요청을 거부했습니다 [" + " / ".join(reasons) + "]. "
+        "--render (Playwright) 로 재시도해 보세요.",
+        last_body,
+    )
 
 
-def render_product_html(url: str, timeout: int = 30) -> Tuple[Optional[str], Optional[str]]:
+def render_product_html(url: str, timeout: int = 30) -> FetchResult:
     """Playwright 로 실제 브라우저 렌더링. 헤더 위장이 막혔을 때의 폴백."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return None, ("playwright 가 설치되어 있지 않습니다. "
-                      "pip install playwright && playwright install chromium")
+        return FetchResult(None, "playwright 가 설치되어 있지 않습니다. "
+                                 "pip install playwright && playwright install chromium", None)
 
     try:
         with sync_playwright() as p:
@@ -164,9 +227,11 @@ def render_product_html(url: str, timeout: int = 30) -> Tuple[Optional[str], Opt
                 pass
             html = page.content()
             browser.close()
-        return html, None
+        if _looks_blocked(html):
+            return FetchResult(None, "렌더링은 됐지만 차단 페이지입니다.", html)
+        return FetchResult(html, None, html)
     except Exception as e:
-        return None, f"렌더링 실패: {e}"
+        return FetchResult(None, f"렌더링 실패: {e}", None)
 
 
 # ==================================================================
@@ -451,12 +516,12 @@ if HAS_FASTAPI:
             return ProductRes(ok=False, error="url 또는 product_id 중 하나는 필요합니다.")
 
         url = build_product_url(product_id, item_id, vendor_item_id)
-        html, err = (render_product_html(url) if req.render else fetch_product_html(url))
-        if err:
+        fetched = render_product_html(url) if req.render else fetch_product_html(url)
+        if fetched.error:
             return ProductRes(ok=False, product_id=product_id, item_id=item_id,
-                              url=url, error=err)
+                              url=url, error=fetched.error)
 
-        data = extract_product(html)
+        data = extract_product(fetched.html)
         if data["name"] is None and data["price"] is None:
             return ProductRes(
                 ok=False, product_id=product_id, item_id=item_id, url=url,
@@ -491,17 +556,19 @@ if __name__ == "__main__":
     pid, iid, vid = parse_product_url(target)
     full_url = build_product_url(pid, iid, vid) if pid else target
 
-    page_html, fetch_err = (render_product_html(full_url) if "--render" in sys.argv
-                            else fetch_product_html(full_url))
-    if fetch_err:
-        print(f"[실패] {fetch_err}")
-        raise SystemExit(2)
+    fetched = (render_product_html(full_url) if "--render" in sys.argv
+               else fetch_product_html(full_url))
 
-    if "--dump" in sys.argv:
+    # 차단당했을 때가 오히려 덤프가 필요한 순간이므로, 종료 전에 먼저 저장한다.
+    if "--dump" in sys.argv and fetched.body:
         _i = sys.argv.index("--dump") + 1
         dump_path = sys.argv[_i] if _i < len(sys.argv) else "out.html"
         with open(dump_path, "w", encoding="utf-8") as fp:
-            fp.write(page_html)
-        print(f"[dump] {dump_path} ({len(page_html):,} bytes)")
+            fp.write(fetched.body)
+        print(f"[dump] {dump_path} ({len(fetched.body):,} bytes)")
 
-    print(json.dumps(extract_product(page_html), ensure_ascii=False, indent=2))
+    if fetched.error:
+        print(f"[실패] {fetched.error}")
+        raise SystemExit(2)
+
+    print(json.dumps(extract_product(fetched.html), ensure_ascii=False, indent=2))
