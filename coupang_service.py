@@ -310,7 +310,9 @@ def render_product_html(url: str, timeout: int = 30,
 # ==================================================================
 # 3) 값 정규화
 # ==================================================================
+# og:title / <title> 은 "{상품명} - {말단카테고리} | 쿠팡" 형식이다.
 TITLE_SUFFIX_RE = re.compile(r"\s*[-|]\s*쿠팡!?\s*$")
+TITLE_CATEGORY_RE = re.compile(r"\s*-\s*[^-,|]{1,20}$")
 
 # coupangcdn 은 경로에 썸네일 크기가 박혀 있다:
 #   //thumbnail10.coupangcdn.com/thumbnails/remote/230x230ex/image/retail/images/....jpg
@@ -324,12 +326,19 @@ NON_PRODUCT_HINTS = ("logo", "icon", "sprite", "banner", "badge", "btn_",
                      "bg_", "placeholder", "blank", "dummy")
 
 
-def clean_name(name: Optional[str]) -> Optional[str]:
-    """공백 정리 + 뒤에 붙는 ' - 쿠팡!' 꼬리표 제거."""
+def clean_name(name: Optional[str], from_title: bool = False) -> Optional[str]:
+    """공백 정리 + 뒤에 붙는 '| 쿠팡' 꼬리표 제거.
+
+    from_title=True 는 og:title / <title> 에서 뽑은 이름일 때만 준다. 이 경우에만
+    그 앞의 ' - 향수' 같은 카테고리 꼬리표까지 떼어낸다. JSON-LD 의 name 은 이미
+    깨끗하고, 상품명 자체에 하이픈이 들어갈 수 있어 잘라내면 안 된다.
+    """
     if not name:
         return None
     name = re.sub(r"\s+", " ", str(name)).strip()
     name = TITLE_SUFFIX_RE.sub("", name).strip()
+    if from_title:
+        name = TITLE_CATEGORY_RE.sub("", name).strip()
     return name or None
 
 
@@ -394,17 +403,34 @@ PRICE_SELECTORS = [
     ".price-value",
     ".prod-price-value",
 ]
+# 새 SDP(sdp-next)는 가격에 의미 있는 클래스를 주지 않고 유틸리티 클래스만 쓴다.
+# 그래서 가격 영역 컨테이너를 잡아 그 안의 첫 '12,345원' 을 읽는다. 괄호로 묶인
+# 단위가(1개당 …)는 뒤에 나오므로 첫 매치가 판매가다.
+PRICE_CONTAINER_SELECTORS = [
+    ".price-layout-container",
+    ".price-container",
+    ".prod-price",
+]
+PRICE_TEXT_RE = re.compile(r"([0-9][0-9,]*)\s*원")
 IMAGE_SELECTORS = [
     "img.prod-image__detail",
     ".prod-image__detail img",
     ".prod-image__item img",
     ".prod-image img",
+    'img[alt="Product image"]',
+    ".product-image img",
 ]
+# 인라인 JS 안의 가격. Next.js RSC 페이로드(self.__next_f.push)는 따옴표가
+# \" 로 이스케이프되어 있으므로 백슬래시를 선택적으로 허용해야 한다.
+def _price_key_re(key: str) -> "re.Pattern[str]":
+    return re.compile(r'\\?"' + key + r'\\?"\s*:\s*\\?"?([0-9][0-9,]*)')
+
+
 PRICE_JSON_RES = [
-    re.compile(r'"couponPrice"\s*:\s*"?([0-9,]+)"?'),
-    re.compile(r'"salePrice"\s*:\s*"?([0-9,]+)"?'),
-    re.compile(r'"finalPrice"\s*:\s*"?([0-9,]+)"?'),
-    re.compile(r'"price"\s*:\s*"?([0-9,]+)"?'),
+    _price_key_re("couponPrice"),
+    _price_key_re("salePrice"),
+    _price_key_re("finalPrice"),
+    _price_key_re("price"),
 ]
 CDN_IMAGE_RE = re.compile(
     r'(?:https?:)?//[a-z0-9.\-]*coupangcdn\.com/[^\s"\'<>]+?\.(?:jpg|jpeg|png|webp)',
@@ -485,7 +511,7 @@ def extract_product(html: str) -> Dict[str, Any]:
     take("image", normalize_image_url(ld_image), "json-ld")
 
     # 2) OG / 메타 태그
-    take("name", clean_name(_meta(soup, "og:title")), "og:title")
+    take("name", clean_name(_meta(soup, "og:title"), from_title=True), "og:title")
     take("price", parse_price(_meta(soup, "product:price:amount")
                               or _meta(soup, "og:price:amount")), "og:price")
     take("image", normalize_image_url(_meta(soup, "og:image")), "og:image")
@@ -502,6 +528,15 @@ def extract_product(html: str) -> Dict[str, Any]:
             node = soup.select_one(sel)
             if node and parse_price(node.get_text(" ", strip=True)):
                 take("price", parse_price(node.get_text(" ", strip=True)), f"dom:{sel}")
+                break
+    if found["price"] is None:
+        for sel in PRICE_CONTAINER_SELECTORS:
+            node = soup.select_one(sel)
+            if not node:
+                continue
+            m = PRICE_TEXT_RE.search(node.get_text(" ", strip=True))
+            if m and parse_price(m.group(1)):
+                take("price", parse_price(m.group(1)), f"dom:{sel}")
                 break
     if found["image"] is None:
         for sel in IMAGE_SELECTORS:
@@ -529,7 +564,7 @@ def extract_product(html: str) -> Dict[str, Any]:
                 take("image", candidate, "regex:coupangcdn")
                 break
     if found["name"] is None and soup.title:
-        take("name", clean_name(soup.title.get_text(strip=True)), "title")
+        take("name", clean_name(soup.title.get_text(strip=True), from_title=True), "title")
 
     return {
         "name": found["name"],
