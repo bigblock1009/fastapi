@@ -6,7 +6,8 @@
 
 엔드포인트 (main.py 에 /coupang prefix 로 마운트됨)
   GET  /coupang/health    → 헬스체크
-  POST /coupang/product   → {url} 또는 {product_id} → 상품 정보 JSON
+  POST /coupang/product   → {url} 또는 {product_id} → 상품 정보 JSON (직접 수집)
+  POST /coupang/parse     → {html} → 상품 정보 JSON (이미 확보한 소스를 파싱)
 
 추출 전략 (위에서부터 시도, 먼저 성공한 값을 채택)
   1) JSON-LD (<script type="application/ld+json">) 의 Product 스키마
@@ -27,6 +28,7 @@
 
 import copy
 import json
+import os
 import re
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
@@ -680,9 +682,55 @@ if HAS_FASTAPI:
         error: Optional[str] = None
 
 
+    def _to_response(data: Dict[str, Any],
+                     product_id: Optional[str],
+                     item_id: Optional[str],
+                     vendor_item_id: Optional[str],
+                     debug: bool) -> "ProductRes":
+        """추출 결과를 응답 모델로 옮긴다. product/parse 가 공유한다."""
+        return ProductRes(
+            ok=True,
+            product_id=product_id,
+            item_id=item_id,
+            url=build_product_url(product_id, item_id, vendor_item_id)
+            if product_id else None,
+            name=data["name"],
+            price=data["price"],
+            price_text=f"{data['price']:,}원" if data["price"] else None,
+            original_price=data["original_price"],
+            original_price_text=(f"{data['original_price']:,}원"
+                                 if data["original_price"] else None),
+            discount_rate=data["discount_rate"],
+            thumbnail=data["thumbnail"],
+            sources=data["sources"] if debug else None,
+        )
+
+
     @router.get("/health")
     def coupang_health():
         return {"ok": True, "service": "coupang-product", "version": "1.0"}
+
+
+    class ParseReq(BaseModel):
+        html: str = Field(..., description="쿠팡 상품 페이지 HTML 원문")
+        url: Optional[str] = Field(None, description="식별값 채우기용 원본 URL(선택)")
+        debug: bool = Field(False, description="True면 어느 전략에서 값을 얻었는지 함께 반환")
+
+
+    @router.post("/parse", response_model=ProductRes)
+    def parse_html(req: ParseReq):
+        """이미 확보한 HTML 을 파싱한다. 수집 단계를 건너뛰는 경로.
+
+        쿠팡은 Akamai Bot Manager 로 자동 수집을 막는다. 브라우저에서 연 페이지의
+        소스를 그대로 넘기면 봇 판정 없이 같은 결과를 얻을 수 있다.
+        """
+        product_id, item_id, vendor_item_id = parse_product_url(req.url or "")
+        data = extract_product(req.html)
+        if data["name"] is None and data["price"] is None:
+            return ProductRes(ok=False, product_id=product_id, item_id=item_id,
+                              error="HTML 에서 상품 정보를 찾지 못했습니다.",
+                              sources=data["sources"] if req.debug else None)
+        return _to_response(data, product_id, item_id, vendor_item_id, req.debug)
 
 
     @router.post("/product", response_model=ProductRes)
@@ -715,18 +763,7 @@ if HAS_FASTAPI:
                 sources=data["sources"] if req.debug else None,
             )
 
-        return ProductRes(
-            ok=True, product_id=product_id, item_id=item_id, url=url,
-            name=data["name"],
-            price=data["price"],
-            price_text=f"{data['price']:,}원" if data["price"] else None,
-            original_price=data["original_price"],
-            original_price_text=(f"{data['original_price']:,}원"
-                                 if data["original_price"] else None),
-            discount_rate=data["discount_rate"],
-            thumbnail=data["thumbnail"],
-            sources=data["sources"] if req.debug else None,
-        )
+        return _to_response(data, product_id, item_id, vendor_item_id, req.debug)
 
 
 # ==================================================================
@@ -740,9 +777,18 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print('사용법: python coupang_service.py "<쿠팡 상품 URL>" '
               '[--render] [--headful] [--dump out.html]')
+        print('       python coupang_service.py <저장한 HTML 파일 경로>')
         raise SystemExit(1)
 
     target = sys.argv[1]
+
+    # 브라우저에서 저장한 HTML 파일을 그대로 넘길 수 있다. 쿠팡이 봇을 막으므로
+    # 실무에서는 이 경로가 가장 확실하다.
+    if os.path.isfile(target):
+        with open(target, encoding="utf-8", errors="replace") as fp:
+            print(json.dumps(extract_product(fp.read()), ensure_ascii=False, indent=2))
+        raise SystemExit(0)
+
     pid, iid, vid = parse_product_url(target)
     full_url = build_product_url(pid, iid, vid) if pid else target
 
