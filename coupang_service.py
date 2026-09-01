@@ -202,36 +202,109 @@ def fetch_product_html(url: str, timeout: int = 20) -> FetchResult:
     )
 
 
-def render_product_html(url: str, timeout: int = 30) -> FetchResult:
-    """Playwright 로 실제 브라우저 렌더링. 헤더 위장이 막혔을 때의 폴백."""
+# Playwright 기본 Chromium 은 navigator.webdriver = true 를 노출한다. 자동화
+# 탐지의 1순위 신호라, 실제 크롬과 다른 부분만 최소한으로 맞춰준다.
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || {runtime: {}};
+"""
+
+
+def render_product_html(url: str, timeout: int = 30,
+                        headful: bool = False) -> FetchResult:
+    """Playwright 로 실제 브라우저 렌더링. 헤더 위장이 막혔을 때의 폴백.
+
+    쿠팡은 자동화 브라우저를 여러 신호로 걸러내므로 다음을 함께 맞춘다.
+      - navigator.webdriver 등 자동화 흔적 제거 (STEALTH_JS)
+      - 쿠팡 홈을 먼저 열어 쿠키를 쌓은 뒤 상품 페이지로 이동
+        (딥링크 직행이 가장 봇처럼 보이는 패턴이다)
+      - 한국 로캘/타임존
+      - headful=True 면 실제 창을 띄운다. 헤드리스보다 탐지율이 훨씬 낮다.
+    데스크톱이 막히면 모바일 경로로 한 번 더 시도한다.
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return FetchResult(None, "playwright 가 설치되어 있지 않습니다. "
                                  "pip install playwright && playwright install chromium", None)
 
+    pid, iid, vid = parse_product_url(url)
+    targets = [("desktop", url, "https://www.coupang.com/", BASE_HEADERS["User-Agent"],
+                {"width": 1440, "height": 900}, False)]
+    if pid:
+        targets.append(("mobile", build_mobile_url(pid, iid, vid), "https://m.coupang.com/",
+                        MOBILE_HEADERS["User-Agent"], {"width": 390, "height": 844}, True))
+
+    last_body: Optional[str] = None
+    reasons = []
+
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(args=["--no-sandbox"])
-            ctx = browser.new_context(
-                user_agent=BASE_HEADERS["User-Agent"],
-                locale="ko-KR",
-                viewport={"width": 1440, "height": 900},
+            browser = p.chromium.launch(
+                headless=not headful,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
             )
-            page = ctx.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            # 메타 태그가 붙을 때까지 잠깐 기다린다. 없어도 그냥 진행.
             try:
-                page.wait_for_selector("meta[property='og:title']", timeout=5000)
-            except Exception:
-                pass
-            html = page.content()
-            browser.close()
-        if _looks_blocked(html):
-            return FetchResult(None, "렌더링은 됐지만 차단 페이지입니다.", html)
-        return FetchResult(html, None, html)
+                for label, target, home, ua, viewport, is_mobile in targets:
+                    ctx = browser.new_context(
+                        user_agent=ua,
+                        locale="ko-KR",
+                        timezone_id="Asia/Seoul",
+                        viewport=viewport,
+                        is_mobile=is_mobile,
+                        has_touch=is_mobile,
+                        extra_http_headers={"Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8"},
+                    )
+                    ctx.add_init_script(STEALTH_JS)
+                    page = ctx.new_page()
+
+                    # 홈을 먼저 열어 쿠키를 쌓는다. 바로 상품 URL 로 가면 막힌다.
+                    try:
+                        page.goto(home, wait_until="domcontentloaded",
+                                  timeout=timeout * 1000)
+                        page.wait_for_timeout(2000)
+                    except Exception:
+                        pass  # 워밍업 실패는 치명적이지 않다.
+
+                    try:
+                        page.goto(target, wait_until="domcontentloaded",
+                                  timeout=timeout * 1000)
+                    except Exception as e:
+                        reasons.append(f"{label}: 이동 실패({e.__class__.__name__})")
+                        ctx.close()
+                        continue
+
+                    # 상품 메타가 붙을 때까지 기다린다. 없으면 잠깐 더 주고 진행.
+                    try:
+                        page.wait_for_selector("meta[property='og:title']", timeout=8000)
+                    except Exception:
+                        page.wait_for_timeout(3000)
+
+                    html = page.content()
+                    landed, page_title = page.url, (page.title() or "")
+                    ctx.close()
+                    last_body = html
+
+                    if _looks_blocked(html):
+                        reasons.append(f"{label}: {len(html):,}B / 제목={page_title!r} "
+                                       f"/ 도착={landed}")
+                        continue
+
+                    return FetchResult(html, None, html)
+            finally:
+                browser.close()
     except Exception as e:
-        return FetchResult(None, f"렌더링 실패: {e}", None)
+        return FetchResult(None, f"렌더링 실패: {e}", last_body)
+
+    return FetchResult(
+        None,
+        "렌더링은 됐지만 상품 페이지가 아닙니다 [" + " / ".join(reasons) + "]. "
+        + ("--headful 로 창을 띄워 실제 화면을 확인해 보세요."
+           if not headful else "덤프된 HTML 을 열어 어떤 화면인지 확인하세요."),
+        last_body,
+    )
 
 
 # ==================================================================
@@ -549,14 +622,16 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print('사용법: python coupang_service.py "<쿠팡 상품 URL>" [--render] [--dump out.html]')
+        print('사용법: python coupang_service.py "<쿠팡 상품 URL>" '
+              '[--render] [--headful] [--dump out.html]')
         raise SystemExit(1)
 
     target = sys.argv[1]
     pid, iid, vid = parse_product_url(target)
     full_url = build_product_url(pid, iid, vid) if pid else target
 
-    fetched = (render_product_html(full_url) if "--render" in sys.argv
+    fetched = (render_product_html(full_url, headful="--headful" in sys.argv)
+               if "--render" in sys.argv or "--headful" in sys.argv
                else fetch_product_html(full_url))
 
     # 차단당했을 때가 오히려 덤프가 필요한 순간이므로, 종료 전에 먼저 저장한다.
